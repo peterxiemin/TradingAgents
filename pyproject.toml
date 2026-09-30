@@ -9,25 +9,30 @@ description = "TradingAgents: Multi-Agents LLM Financial Trading Framework"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "langchain-core>=1.6.5",
-    "langchain-anthropic>=1.7.4",
-    "langchain-google-genai>=4.4.0",
-    "langchain-openai>=1.6.6",
-    "langgraph>=1.2.12",
-    "langgraph-checkpoint-sqlite>=3.1.1",
+    "openai-codex==0.159.2",
+    "pydantic>=2.12,<3",
     "pandas>=3.0.6",
     "python-dotenv>=1.0.0",
     "pytz>=2025.2",
-    "questionary>=2.1.0",
     "requests>=2.32.4",
-    "rich>=14.0.0",
-    "typer>=0.21.0",
     "stockstats>=0.6.5",
     "typing-extensions>=4.14.0",
     "yfinance>=1.7.0",
 ]
 
 [project.optional-dependencies]
+# Original framework is retained for comparison, never imported by the new CLI.
+legacy = [
+    "langchain-core>=1.6.5",
+    "langchain-anthropic>=1.7.4",
+    "langchain-google-genai>=4.4.0",
+    "langchain-openai>=1.6.6",
+    "langgraph>=1.2.12",
+    "langgraph-checkpoint-sqlite>=3.1.1",
+    "questionary>=2.1.0",
+    "rich>=14.0.0",
+    "typer>=0.21.0",
+]
 dev = [
     "ruff>=0.16",
     "pytest>=8.0",
@@ -40,7 +45,9 @@ bedrock = [
 ]
 
 [project.scripts]
-tradingagents = "cli.main:app"
+tradingagents = "tradingagents_codex.cli:main"
+tradingagents-codex = "tradingagents_codex.cli:main"
+tradingagents-legacy = "cli.main:app"
 
 [tool.setuptools.dynamic]
 version = {attr = "tradingagents.__version__"}
@@ -52,7 +59,7 @@ include = ["tradingagents*", "cli*"]
 cli = ["static/*"]
 
 [tool.pytest.ini_options]
-testpaths = ["tests"]
+testpaths = ["tests_codex"]
 addopts = "-ra --strict-markers -m \"not integration\""
 markers = [
     "unit: fast isolated unit tests",

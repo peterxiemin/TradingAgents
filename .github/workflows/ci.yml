@@ -35,6 +35,17 @@ jobs:
       - name: Run test suite
         run: pytest -q
 
+  legacy-tests:
+    name: optional legacy regression
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - run: pip install ".[legacy,dev]"
+      - run: pytest -q tests
+
   smoke-install:
     name: clean-install smoke
     runs-on: ubuntu-latest
@@ -49,7 +60,7 @@ jobs:
           pip install .
           # Catches undeclared runtime deps (e.g. #994 python-dotenv): a bare
           # install must import the package and the CLI module.
-          python -c "import tradingagents, cli.main; print('clean-install import OK')"
+          python -c "import tradingagents_codex, tradingagents_codex.cli; print('clean-install import OK')"
 
   lint:
     name: ruff (strict, full repo)
