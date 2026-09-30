@@ -54,6 +54,21 @@ class AuditEvent(FrozenModel):
     detail: str | None = None
 
 
+class TokenCounters(FrozenModel):
+    """SDK counters; cached/reasoning are subsets, not extra billable additions."""
+
+    input_tokens: int | None = Field(default=None, ge=0)
+    cached_input_tokens: int | None = Field(default=None, ge=0)
+    output_tokens: int | None = Field(default=None, ge=0)
+    reasoning_output_tokens: int | None = Field(default=None, ge=0)
+    total_tokens: int | None = Field(default=None, ge=0)
+
+
+class RoleTokenUsage(TokenCounters):
+    role: Role
+    model: str | None = None
+
+
 class RunReport(FrozenModel):
     format_version: Literal[1] = 1
     run_id: str
@@ -66,6 +81,9 @@ class RunReport(FrozenModel):
     outputs: tuple[RoleOutput, ...]
     final_decision: RoleOutput
     audit: tuple[AuditEvent, ...]
+    role_token_usage: tuple[RoleTokenUsage, ...] = ()
+    token_totals: TokenCounters | None = None
+    token_usage_complete: bool = False
     execution: Literal["research_only_no_orders"] = "research_only_no_orders"
 
 

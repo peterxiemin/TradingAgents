@@ -230,6 +230,26 @@ def test_worker_env_and_cache_paths_are_isolated(monkeypatch):
     assert os.environ["PYTHON_DOTENV_DISABLED"] == "0"
 
 
+def test_worker_transport_requires_explicit_validated_mapping(monkeypatch, tmp_path):
+    monkeypatch.setenv("HTTPS_PROXY", "http://secret:password@localhost:1234")
+    assert "HTTPS_PROXY" not in snap._worker_env(str(tmp_path))
+    values = {"HTTPS_PROXY": "http://127.0.0.1:4321"}
+    assert snap._worker_env(str(tmp_path), values)["HTTPS_PROXY"] == values["HTTPS_PROXY"]
+    with pytest.raises(ValueError):
+        snap._worker_env(str(tmp_path), {"HTTPS_PROXY": "http://secret:password@localhost:1234"})
+
+
+def test_collect_passes_only_validated_transport_to_subprocess(monkeypatch):
+    def fake_run(args, **kwargs):
+        assert kwargs["env"]["HTTPS_PROXY"] == "http://127.0.0.1:4321"
+        assert "OPENAI_API_KEY" not in kwargs["env"]
+        return SimpleNamespace(stdout="", returncode=0)
+    monkeypatch.setattr(snap.subprocess, "run", fake_run)
+    snap.collect_snapshot("SPY", date(2025, 1, 1), transport_env={
+        "HTTPS_PROXY": "http://127.0.0.1:4321",
+    })
+
+
 def test_protocol_rejects_wrong_identity_malformed_and_oversized_output():
     good = snap._item(snap._SPECS[0], "result", "available")
     bad = good.model_copy(update={"source": "Unapproved source"})

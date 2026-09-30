@@ -31,6 +31,8 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from .transport import validate_transport_env
+
 Category = Literal["market", "fundamentals", "news", "sentiment"]
 Status = Literal["available", "unavailable", "withheld"]
 MAX_CONTENT_CHARS = 8_000
@@ -202,7 +204,7 @@ def demo_snapshot(ticker: str = "SPY", as_of: date | None = None) -> Snapshot:
     )
 
 
-def _worker_env(run_dir: str) -> dict[str, str]:
+def _worker_env(run_dir: str, transport_env: dict[str, str] | None = None) -> dict[str, str]:
     """A small allowlist, not a copy of host API keys, proxies, or credentials."""
     env = {
         "PATH": os.defpath,
@@ -219,13 +221,11 @@ def _worker_env(run_dir: str) -> dict[str, str]:
     }
     for key in (
         "SYSTEMROOT",
-        "SSL_CERT_FILE",
-        "SSL_CERT_DIR",
-        "REQUESTS_CA_BUNDLE",
         "SEC_EDGAR_USER_AGENT",
     ):
         if key in os.environ:
             env[key] = os.environ[key]
+    env.update(validate_transport_env(transport_env or {}))
     return env
 
 
@@ -247,7 +247,8 @@ def _decode_worker(output: str | bytes | None) -> dict[str, Evidence]:
     return found
 
 
-def collect_snapshot(ticker: str, as_of: date, *, timeout_seconds: float = 60) -> Snapshot:
+def collect_snapshot(ticker: str, as_of: date, *, timeout_seconds: float = 60,
+                     transport_env: dict[str, str] | None = None) -> Snapshot:
     """Collect the allowlisted sources once; failures become explicit evidence.
 
     This synchronous call has a hard subprocess deadline. Complete results
@@ -262,6 +263,7 @@ def collect_snapshot(ticker: str, as_of: date, *, timeout_seconds: float = 60) -
         or not 0 < timeout_seconds <= 600
     ):
         raise ValueError("timeout_seconds must be finite and in (0, 600]")
+    safe_transport = validate_transport_env(transport_env or {})
     captured_at = datetime.now(UTC)
     missing_reason = "Collection worker did not return this source; no financial fact is inferred."
     with tempfile.TemporaryDirectory(prefix="tradingagents-codex-data-") as run_dir:
@@ -282,7 +284,7 @@ def collect_snapshot(ticker: str, as_of: date, *, timeout_seconds: float = 60) -
                 timeout=timeout_seconds,
                 check=False,
                 cwd=run_dir,
-                env=_worker_env(run_dir),
+                env=_worker_env(run_dir, safe_transport),
             )
             found = _decode_worker(result.stdout)
         except subprocess.TimeoutExpired as exc:

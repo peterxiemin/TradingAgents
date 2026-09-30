@@ -3,19 +3,32 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 import uuid
 from collections.abc import Callable
 from datetime import UTC, datetime
 
 from pydantic import ValidationError
 
-from .contracts import AuditEvent, Backend, ResearchError, Role, RoleOutput, RunConfig, RunReport
+from .contracts import (
+    AuditEvent,
+    Backend,
+    ResearchError,
+    Role,
+    RoleOutput,
+    RoleTokenUsage,
+    RunConfig,
+    RunReport,
+    TokenCounters,
+)
 from .prompts import ANALYSTS, RISK_ROLES, build_prompt
 from .snapshot import Snapshot
 
 _ACTION_FOR_RATING = {
     "Buy": "Buy", "Overweight": "Buy", "Hold": "Hold", "Underweight": "Sell", "Sell": "Sell",
 }
+_BACKEND_OWNERS: dict[int, object] = {}
+_BACKEND_OWNERS_LOCK = threading.Lock()
 
 
 class Orchestrator:
@@ -36,10 +49,28 @@ class Orchestrator:
             item.category == "market" and item.status == "available" for item in validated.evidence
         ):
             raise ResearchError("Live research requires usable market evidence; no model calls started")
+        # The SDK backend exposes cumulative per-attempt telemetry. Sharing one
+        # backend across overlapping runs would mix reports, so explicitly own
+        # it for the whole run (including cancellation cleanup). Separate backend
+        # instances remain fully concurrent.
+        with _BACKEND_OWNERS_LOCK:
+            if id(self.backend) in _BACKEND_OWNERS:
+                raise ResearchError("A backend can serve only one active research run")
+            _BACKEND_OWNERS[id(self.backend)] = self
         self._running = True
+        try:
+            return await self._run_owned(validated)
+        finally:
+            self._running = False
+            with _BACKEND_OWNERS_LOCK:
+                _BACKEND_OWNERS.pop(id(self.backend), None)
+
+    async def _run_owned(self, validated: Snapshot) -> RunReport:
         self._audit: list[AuditEvent] = []
         self._semaphore = asyncio.Semaphore(self.config.max_concurrency)
         self._calls = 0
+        self._backend_attempts = 0
+        usage_start = len(getattr(self.backend, "usage_records", ()))
         # Deep validation creates our own frozen copy rather than sharing caller state.
         self._snapshot = validated
         original_hash = self._snapshot.fingerprint()
@@ -63,12 +94,24 @@ class Orchestrator:
                 if self._snapshot.fingerprint() != original_hash:
                     raise ResearchError("Shared snapshot changed during analysis")
                 self._emit("run_completed")
+                usage = tuple(RoleTokenUsage.model_validate(record) for record in
+                              getattr(self.backend, "usage_records", ())[usage_start:])
+                # A missing counter stays unknown. Do not present partial counts
+                # as complete or double-count reasoning/cached token subsets.
+                totals = TokenCounters(**{
+                    field: (sum(getattr(record, field) for record in usage)
+                            if all(getattr(record, field) is not None for record in usage) else None)
+                    for field in TokenCounters.model_fields
+                }) if usage else None
                 return RunReport(
                     run_id=uuid.uuid4().hex, mode=self._snapshot.mode,
                     ticker=self._snapshot.ticker, as_of=self._snapshot.as_of,
                     generated_at=datetime.now(UTC), snapshot_hash=original_hash,
                     config=self.config, outputs=tuple(outputs), final_decision=final,
                     audit=tuple(self._audit),
+                    role_token_usage=usage, token_totals=totals,
+                    token_usage_complete=bool(usage) and len(usage) == self._backend_attempts
+                    and all(record.total_tokens is not None for record in usage),
                 )
         except TimeoutError as exc:
             self._emit("run_failed", detail="Overall timeout")
@@ -81,8 +124,6 @@ class Orchestrator:
             if isinstance(exc, ResearchError):
                 raise
             raise ResearchError("Research failed; no completed decision was produced") from exc
-        finally:
-            self._running = False
 
     def _emit(self, event: str, **kwargs) -> None:
         item = AuditEvent(sequence=len(self._audit) + 1, event=event, **kwargs)
@@ -107,6 +148,7 @@ class Orchestrator:
                     if len(prompt) > self.config.max_prompt_chars:
                         raise ResearchError("Prompt budget exceeded; reduce rounds or evidence size")
                     async with asyncio.timeout(self.config.role_timeout_seconds):
+                        self._backend_attempts += 1
                         raw = await self.backend.generate(
                             role=role, prompt=prompt, output_schema=RoleOutput.model_json_schema(),
                         )

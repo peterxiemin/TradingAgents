@@ -22,6 +22,7 @@ import os
 import re
 import subprocess
 import threading
+from collections.abc import Mapping
 from contextlib import suppress
 from dataclasses import dataclass, field
 from importlib.metadata import version
@@ -47,16 +48,26 @@ from openai_codex.generated.v2_all import (
     TextUserInput,
     ThreadStartParams,
     ThreadStartResponse,
+    ThreadTokenUsageUpdatedNotification,
     TurnCompletedNotification,
     TurnStartParams,
     TurnStatus,
     UserInput,
 )
 
+from .transport import validate_transport_env
+
 SUPPORTED_SDK_VERSION = "0.159.2"
 _INTERRUPT_TIMEOUT = 1.0
 _ROLE = re.compile(r"[a-zA-Z0-9_-]{1,64}\Z")
 _SAFE_ITEM_TYPES = frozenset({"userMessage", "agentMessage", "reasoning"})
+_USAGE_COUNTERS = (
+    "input_tokens",
+    "cached_input_tokens",
+    "output_tokens",
+    "reasoning_output_tokens",
+    "total_tokens",
+)
 
 # These are runtime flags, not merely model instructions. Pin the SDK/runtime
 # and inspect new versions before changing this capability boundary.
@@ -154,7 +165,9 @@ def _reject_server_request(method: str, _params: dict | None) -> dict:
     raise CodexSecurityError(f"Unexpected Codex server request: {method}")
 
 
-def _launch_config(codex_home: Path, cwd: Path) -> CodexConfig:
+def _launch_config(
+    codex_home: Path, cwd: Path, transport_env: Mapping[str, str] | None = None
+) -> CodexConfig:
     if os.name != "posix" or not Path("/usr/bin/env").is_file():
         raise CodexSecurityError("This isolated launch currently requires POSIX /usr/bin/env")
     if version("openai-codex") != SUPPORTED_SDK_VERSION:
@@ -171,6 +184,7 @@ def _launch_config(codex_home: Path, cwd: Path) -> CodexConfig:
         "LANG=C.UTF-8",
         f"HOME={cwd}",
         f"CODEX_HOME={codex_home}",
+        *(f"{key}={value}" for key, value in validate_transport_env(transport_env).items()),
         str(bundled_codex_path()),
         "--strict-config",
     ]
@@ -259,6 +273,7 @@ class _Session:
     turn_id: str | None = None
     task: asyncio.Task | None = None
     finished: bool = False
+    usage_record: dict[str, Any] = field(default_factory=dict)
 
     def start(self) -> None:
         # Serialize startup with close. Cancellation before a worker gets CPU
@@ -311,6 +326,7 @@ def _run_session(
         )
     )
     session.thread_id = started.thread.id
+    session.usage_record["model"] = started.model
     _check_thread(started, cwd)
     session.check_stopping()
     item = UserInput(root=TextUserInput(type="text", text=prompt))
@@ -341,6 +357,15 @@ def _run_session(
             session.check_stopping()
             event = client.next_turn_notification(session.turn_id)
             payload = event.payload
+            if isinstance(payload, ThreadTokenUsageUpdatedNotification):
+                if payload.turn_id != session.turn_id or payload.thread_id != session.thread_id:
+                    raise CodexSecurityError("Received usage from another Codex session")
+                # The runtime's `total` is cumulative for this isolated thread.
+                # Repeated updates replace counters, never add them. Cached input
+                # and reasoning output are subdivisions, not additional tokens.
+                session.usage_record.update(
+                    {name: getattr(payload.token_usage.total, name) for name in _USAGE_COUNTERS}
+                )
             if isinstance(payload, (ItemStartedNotification, ItemCompletedNotification)):
                 if payload.turn_id != session.turn_id or payload.thread_id != session.thread_id:
                     raise CodexSecurityError("Received an event from another Codex session")
@@ -388,8 +413,17 @@ class CodexBackend:
     its own app-home authentication when the caller explicitly requests a run.
     """
 
-    def __init__(self, model: str | None, codex_home: Path, working_dir: Path):
+    def __init__(
+        self,
+        model: str | None,
+        codex_home: Path,
+        working_dir: Path,
+        *,
+        transport_env: Mapping[str, str] | None = None,
+    ):
         self.model = model
+        self.transport_env = validate_transport_env(transport_env)
+        self.usage_records: list[dict[str, Any]] = []
         self.codex_home = Path(codex_home).expanduser().resolve()
         self.working_dir = Path(working_dir).expanduser().resolve()
         forbidden = {Path.home().resolve(), (Path.home() / ".codex").resolve(), Path("/")}
@@ -432,6 +466,19 @@ class CodexBackend:
                 await session.task
 
     async def generate(self, *, role: str, prompt: str, output_schema: dict) -> str:
+        record = {"role": role, "model": self.model, **dict.fromkeys(_USAGE_COUNTERS)}
+        try:
+            return await self._generate(
+                role=role, prompt=prompt, output_schema=output_schema, usage_record=record
+            )
+        finally:
+            # _generate joins its worker before returning/raising, including
+            # cancellation, so this is a stable record of the latest known usage.
+            self.usage_records.append(dict(record))
+
+    async def _generate(
+        self, *, role: str, prompt: str, output_schema: dict, usage_record: dict[str, Any]
+    ) -> str:
         if self._closed:
             raise RuntimeError("CodexBackend is closed")
         if not _ROLE.fullmatch(role):
@@ -448,9 +495,11 @@ class CodexBackend:
             cwd = Path(private).resolve()
             session = _Session(
                 CodexClient(
-                    _launch_config(self.codex_home, cwd), approval_handler=_reject_server_request
+                    _launch_config(self.codex_home, cwd, self.transport_env),
+                    approval_handler=_reject_server_request,
                 ),
                 cwd,
+                usage_record=usage_record,
             )
             self._sessions.add(session)
             session.task = asyncio.create_task(

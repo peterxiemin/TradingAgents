@@ -35,6 +35,13 @@ tradingagents --live --ticker SPY --date 2026-09-30 \
 
 Optionally pass `--model YOUR_AVAILABLE_CODEX_MODEL`. Leaving it unset uses the configured account default. Live use sends the public research snapshot to the signed-in Codex service and consumes that account's applicable quota/billing. Choose and authorize the account before running it.
 
+Some managed cloud environments require their local proxy and CA bundle. In that case,
+explicitly add `--inherit-transport-env`. This forwards only validated, credential-free
+loopback proxy URLs and existing absolute CA paths to both data collection and Codex.
+Credentials in proxy URLs, external proxy hosts, arbitrary environment keys and TLS
+verification bypasses are rejected. Defaults still inherit no transport settings.
+Machine-specific endpoints and certificate paths are never hardcoded or committed.
+
 Useful limits:
 
 ```bash
@@ -56,6 +63,14 @@ These example dates are examples, not a scheduled job. Supply the actual as-of d
 6. A portfolio manager emits the final five-tier research rating and a consistent hypothetical Buy/Hold/Sell action
 
 The default is 12 inference calls before retries. Debate/risk rounds are capped at three, concurrency at four and attempts at three. There are per-role and overall timeouts, a character budget for prompts, output size/schema validation, evidence-ID ownership checks, cancellation propagation and a stage audit trail. Failures do not silently turn into successful decisions.
+
+When the SDK reports token usage, `report.json` records each role attempt and totals
+across this run. Repeated cumulative updates are not summed; cached input remains a
+subset of input and reasoning output a subset of output. Missing telemetry stays
+unknown and coverage is marked incomplete. These counters are observations, not a
+cost estimate, usage allowance or guaranteed spending cap.
+One backend instance serves one active research run at a time so concurrent runs
+cannot mix usage records; create separate backends for concurrent analyses.
 
 - `tradingagents_codex/contracts.py`: typed configuration, role outputs and reports
 - `snapshot.py`: immutable evidence, as-of safeguards and host-owned data collection

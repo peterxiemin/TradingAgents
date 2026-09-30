@@ -210,3 +210,60 @@ def test_live_decision_must_cite_available_evidence(citations):
     snapshot = demo_snapshot().model_copy(update={"mode": "live"})
     with pytest.raises(ResearchError):
         asyncio.run(Orchestrator(Ungrounded(), RunConfig(max_attempts=1)).run(snapshot))
+
+
+def test_usage_totals_preserve_sdk_semantics_and_run_isolation():
+    class Metered(FakeBackend):
+        def __init__(self):
+            self.usage_records = []
+
+        async def generate(self, **kwargs):
+            raw = await super().generate(**kwargs)
+            self.usage_records.append({
+                "role": kwargs["role"], "model": "test-model", "input_tokens": 100,
+                "cached_input_tokens": 40, "output_tokens": 30,
+                "reasoning_output_tokens": 10, "total_tokens": 130,
+            })
+            return raw
+
+    async def check():
+        runner = Orchestrator(Metered())
+        for _ in range(2):
+            result = await runner.run(demo_snapshot())
+            assert len(result.role_token_usage) == 12
+            assert result.token_totals.total_tokens == 1560
+            assert result.token_totals.output_tokens == 360
+            assert result.token_totals.reasoning_output_tokens == 120
+            assert result.token_usage_complete is True
+    asyncio.run(check())
+
+
+def test_missing_usage_is_unknown_not_zero():
+    result = asyncio.run(Orchestrator(FakeBackend()).run(demo_snapshot()))
+    assert result.token_totals is None
+    assert result.token_usage_complete is False
+
+
+def test_shared_backend_rejects_overlapping_runs_and_releases_afterwards():
+    async def check():
+        backend = RecordingBackend(0.01)
+        one, two = Orchestrator(backend), Orchestrator(backend)
+        first = asyncio.create_task(one.run(demo_snapshot()))
+        await asyncio.sleep(0.002)
+        with pytest.raises(ResearchError, match="only one active research run"):
+            await two.run(demo_snapshot())
+        await first
+        assert len((await two.run(demo_snapshot())).outputs) == 12
+    asyncio.run(check())
+
+
+def test_backend_ownership_released_after_cancellation():
+    async def check():
+        backend = RecordingBackend(0.01)
+        task = asyncio.create_task(Orchestrator(backend).run(demo_snapshot()))
+        await asyncio.sleep(0.002)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len((await Orchestrator(backend).run(demo_snapshot())).outputs) == 12
+    asyncio.run(check())

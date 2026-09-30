@@ -30,6 +30,10 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--date", type=date.fromisoformat, help="As-of date YYYY-MM-DD; demo defaults to 2025-01-15")
     result.add_argument("--model", help="Codex model ID; omit to use the account's default")
     result.add_argument("--codex-home", type=Path, help="Explicit dedicated Codex home, already authenticated by you")
+    result.add_argument(
+        "--inherit-transport-env", action="store_true",
+        help="Opt in to validated credential-free loopback proxy and CA environment settings",
+    )
     result.add_argument("--output-dir", type=Path, default=Path("codex-results"))
     result.add_argument("--language", default="Chinese")
     result.add_argument("--debate-rounds", type=int, default=1)
@@ -55,6 +59,13 @@ def write_report(report: RunReport, snapshot: Snapshot, directory: Path) -> Path
     ]
     if report.mode == "demo":
         lines.extend(["**SYNTHETIC DEMO: fake inference and sample data, not market analysis.**", ""])
+    if report.token_totals is not None:
+        lines.extend([
+            f"SDK-reported token total: {report.token_totals.total_tokens}",
+            f"Usage coverage complete: {report.token_usage_complete}",
+            "Cached-input and reasoning-output counters are subsets, not added again. "
+            "These are token observations, not a bill or a spending guarantee.", "",
+        ])
     for item in report.outputs:
         lines.extend([f"## {item.role}", "", item.summary, ""])
         if item.recommendation:
@@ -80,6 +91,7 @@ async def _execute(args, config: RunConfig, snapshot: Snapshot) -> RunReport:
     async with CodexBackend(
         model=args.model, codex_home=args.codex_home.resolve(),
         working_dir=args.output_dir.resolve() / ".sessions",
+        transport_env=args.transport_env,
     ) as backend:
         return await Orchestrator(backend, config, progress).run(snapshot)
 
@@ -100,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
     # Never auto-discover dotenv files through reused upstream vendor code.
     os.environ["PYTHON_DOTENV_DISABLED"] = "1"
     try:
+        from .transport import read_transport_env
+
+        args.transport_env = read_transport_env() if args.inherit_transport_env else {}
         config = RunConfig(
             debate_rounds=args.debate_rounds, risk_rounds=args.risk_rounds,
             max_concurrency=args.concurrency, max_attempts=args.attempts,
@@ -108,7 +123,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         snapshot = (
             demo_snapshot(args.ticker, args.date) if args.demo else
-            collect_snapshot(args.ticker, args.date, timeout_seconds=args.data_timeout)
+            collect_snapshot(args.ticker, args.date, timeout_seconds=args.data_timeout,
+                             transport_env=args.transport_env)
         )
         report = asyncio.run(_execute(args, config, snapshot))
         saved = write_report(report, snapshot, args.output_dir)

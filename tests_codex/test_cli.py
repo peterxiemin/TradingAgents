@@ -3,7 +3,7 @@ import os
 import subprocess
 import sys
 
-from tradingagents_codex.cli import main
+from tradingagents_codex.cli import main, parser
 
 
 def test_help_needs_no_auth(capsys):
@@ -48,3 +48,13 @@ def test_live_requires_explicit_auth_home():
                              capture_output=True, text=True, timeout=15)
     assert outcome.returncode == 2
     assert "requires --codex-home" in outcome.stderr
+
+
+def test_transport_inheritance_is_explicitly_opted_in():
+    assert parser().parse_args(["--demo"]).inherit_transport_env is False
+    assert parser().parse_args(["--demo", "--inherit-transport-env"]).inherit_transport_env is True
+
+
+def test_demo_ignores_parent_proxy_secrets_by_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("HTTPS_PROXY", "http://sensitive-user:secret@localhost:3128")
+    assert main(["--demo", "--output-dir", str(tmp_path)]) == 0

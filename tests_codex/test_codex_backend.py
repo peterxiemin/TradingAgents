@@ -19,6 +19,7 @@ from openai_codex.generated.v2_all import (
     ItemStartedNotification,
     ThreadStartParams,
     ThreadStartResponse,
+    ThreadTokenUsageUpdatedNotification,
     TurnCompletedNotification,
     TurnStartParams,
     TurnStartResponse,
@@ -144,6 +145,19 @@ class FakeClient:
             self.waiting.set()
             assert self.closed.wait(5), "test transport was not closed during turn start"
             raise RuntimeError("transport closed during turn start")
+        for usage in self.owner.usage_updates:
+            self.events.append(
+                Notification(
+                    "thread/tokenUsage/updated",
+                    ThreadTokenUsageUpdatedNotification.model_validate(
+                        {
+                            "threadId": self.thread_id,
+                            "turnId": self.turn_id,
+                            "tokenUsage": {"total": usage, "last": dict.fromkeys(usage, 0)},
+                        }
+                    ),
+                )
+            )
         message = {
             "type": "agentMessage",
             "id": "message",
@@ -196,7 +210,9 @@ class FakeClient:
 
     def next_turn_notification(self, turn_id):
         assert turn_id == self.turn_id
-        if self.owner.block_stream:
+        if self.owner.block_stream or (
+            self.owner.block_after_usage and self.events[0].method != "thread/tokenUsage/updated"
+        ):
             self.waiting.set()
             assert self.closed.wait(5), "test transport was not closed during stream"
             raise RuntimeError("transport closed")
@@ -220,6 +236,8 @@ class FakeFactory:
         self.block_stream = False
         self.block_turn_start = False
         self.block_interrupt = False
+        self.block_after_usage = False
+        self.usage_updates = []
         self.fail_initialize = False
         self.mutate_config = None
         self.mutate_thread = None
@@ -297,6 +315,44 @@ def test_launch_clears_parent_environment_and_uses_pinned_runtime(monkeypatch, t
     assert overrides["web_search"] == '"disabled"'
     assert overrides["shell_environment_policy.inherit"] == '"none"'
     assert overrides["project_doc_max_bytes"] == "0"
+
+
+def test_transport_is_opt_in_and_only_validated_values_are_forwarded(monkeypatch, tmp_path):
+    monkeypatch.setenv("HTTPS_PROXY", "http://secret:secret@localhost:1234")
+    cert = tmp_path / "test-ca.pem"
+    cert.write_text("contents are not read for metadata validation")
+    transport = {"HTTPS_PROXY": "http://localhost:8080", "SSL_CERT_FILE": str(cert)}
+    backend = adapter.CodexBackend(
+        None,
+        tmp_path / "home",
+        tmp_path / "sessions",
+        transport_env=transport,
+    )
+    transport["HTTPS_PROXY"] = "http://secret:secret@localhost:1234"
+    config = adapter._launch_config(backend.codex_home, tmp_path, backend.transport_env)
+    args = config.launch_args_override
+    assert args[:2] == ("/usr/bin/env", "-i")
+    assert "HTTPS_PROXY=http://localhost:8080" in args
+    assert f"SSL_CERT_FILE={cert}" in args
+    assert not any("secret" in arg for arg in args)
+    default_args = adapter._launch_config(backend.codex_home, tmp_path).launch_args_override
+    assert not any(arg.startswith(("HTTPS_PROXY=", "SSL_CERT_FILE=")) for arg in default_args)
+    with pytest.raises(ValueError):
+        adapter._launch_config(backend.codex_home, tmp_path, transport)
+
+
+def test_generate_passes_explicit_transport_settings(factory, tmp_path):
+    async def exercise():
+        async with adapter.CodexBackend(
+            None,
+            tmp_path / "home",
+            tmp_path / "sessions",
+            transport_env={"ALL_PROXY": "socks5://localhost:1080"},
+        ) as backend:
+            await _generate(backend)
+
+    asyncio.run(exercise())
+    assert "ALL_PROXY=socks5://localhost:1080" in factory.clients[0].config.launch_args_override
 
 
 @pytest.mark.parametrize(
@@ -471,6 +527,87 @@ def test_initialize_failure_closes_process(factory, tmp_path):
     with pytest.raises(RuntimeError, match="initialization failed"):
         asyncio.run(_generate(_backend(tmp_path)))
     assert factory.clients[0].closed.is_set()
+
+
+def _usage(input_tokens=10, cached=4, output=6, reasoning=3, total=16):
+    return {
+        "inputTokens": input_tokens,
+        "cachedInputTokens": cached,
+        "outputTokens": output,
+        "reasoningOutputTokens": reasoning,
+        "totalTokens": total,
+    }
+
+
+def test_usage_records_latest_cumulative_total_without_double_counting(factory, tmp_path):
+    factory.usage_updates = [_usage(), _usage(20, 8, 12, 5, 32)]
+    backend = _backend(tmp_path)
+    asyncio.run(_generate(backend))
+    assert backend.usage_records == [
+        {
+            "role": "market",
+            "model": "fake-model",
+            "input_tokens": 20,
+            "cached_input_tokens": 8,
+            "output_tokens": 12,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 32,
+        }
+    ]
+
+
+def test_usage_record_marks_unavailable_counters_null(factory, tmp_path):
+    backend = _backend(tmp_path)
+    asyncio.run(_generate(backend))
+    assert backend.usage_records == [
+        {
+            "role": "market",
+            "model": "fake-model",
+            **dict.fromkeys(adapter._USAGE_COUNTERS),
+        }
+    ]
+
+
+def test_failed_attempt_preserves_reported_usage(factory, tmp_path):
+    factory.status = "failed"
+    factory.usage_updates = [_usage()]
+    backend = _backend(tmp_path)
+    with pytest.raises(RuntimeError):
+        asyncio.run(_generate(backend))
+    assert len(backend.usage_records) == 1
+    assert backend.usage_records[0]["total_tokens"] == 16
+
+
+def test_cancelled_attempt_preserves_latest_known_usage(factory, tmp_path):
+    factory.usage_updates = [_usage()]
+    factory.block_after_usage = True
+    backend = _backend(tmp_path)
+
+    async def exercise():
+        task = asyncio.create_task(_generate(backend))
+        await _wait_until_blocked(factory)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    asyncio.run(exercise())
+    assert len(backend.usage_records) == 1
+    assert backend.usage_records[0]["total_tokens"] == 16
+    assert backend.usage_records[0]["model"] == "fake-model"
+
+
+def test_initialization_failure_has_a_usage_record(factory, tmp_path):
+    factory.fail_initialize = True
+    backend = _backend(tmp_path)
+    with pytest.raises(RuntimeError):
+        asyncio.run(_generate(backend))
+    assert backend.usage_records == [
+        {
+            "role": "market",
+            "model": None,
+            **dict.fromkeys(adapter._USAGE_COUNTERS),
+        }
+    ]
 
 
 def test_unreviewed_sdk_version_fails_closed(monkeypatch, tmp_path):
